@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useId, useMemo, useState } from "react";
 import Image from "next/image";
 import { isAuthApiError, type Session } from "@supabase/supabase-js";
 import { supabase } from "@/lib/supabaseClient";
@@ -42,6 +42,7 @@ import {
   markAllNotificationsRead,
   markNotificationRead,
   submitIssue,
+  toggleIssueVote,
   updateIssue,
   uploadIssuePhoto,
   verifyIssue,
@@ -249,6 +250,12 @@ function NotificationBell({ userId }: { userId: string }) {
   const [notifications, setNotifications] = useState<Notification[]>([]);
   const [loading, setLoading] = useState(true);
   const [isOpen, setIsOpen] = useState(false);
+  // NotificationBell is mounted twice at once (mobile header + desktop
+  // sidebar — only one is visually hidden via CSS, not unmounted), and
+  // Supabase's realtime client dedupes channels by topic name, returning
+  // the same already-subscribed channel to the second mount and throwing
+  // on its .on() call. A per-instance id keeps their topics distinct.
+  const instanceId = useId();
 
   const unreadCount = notifications.filter((n) => !n.read_at).length;
 
@@ -269,9 +276,12 @@ function NotificationBell({ userId }: { userId: string }) {
 
   useEffect(() => {
     const client = supabase;
-    if (!client) return;
-    const channel = client
-      .channel(`notifications-${userId}`)
+    if (!client || !userId) return;
+
+    let isSubscribed = true;
+    const channel = client.channel(`notifications-${userId}-${instanceId}`);
+
+    const subscription = channel
       .on<Notification>(
         "postgres_changes",
         {
@@ -281,18 +291,28 @@ function NotificationBell({ userId }: { userId: string }) {
           filter: `user_id=eq.${userId}`,
         },
         (payload) => {
+          if (!isSubscribed) return;
           setNotifications((prev) => [payload.new, ...prev]);
         },
       )
-      .subscribe();
+      .subscribe((status) => {
+        if (status !== "SUBSCRIBED") return;
+      });
+
     return () => {
+      isSubscribed = false;
+      void subscription;
       client.removeChannel(channel);
     };
-  }, [userId]);
+  }, [userId, instanceId]);
 
   const handleMarkRead = async (id: string) => {
     setNotifications((prev) =>
-      prev.map((n) => (n.id === id && !n.read_at ? { ...n, read_at: new Date().toISOString() } : n)),
+      prev.map((n) =>
+        n.id === id && !n.read_at
+          ? { ...n, read_at: new Date().toISOString() }
+          : n,
+      ),
     );
     try {
       await markNotificationRead(id);
@@ -303,7 +323,9 @@ function NotificationBell({ userId }: { userId: string }) {
 
   const handleMarkAllRead = async () => {
     const now = new Date().toISOString();
-    setNotifications((prev) => prev.map((n) => (n.read_at ? n : { ...n, read_at: now })));
+    setNotifications((prev) =>
+      prev.map((n) => (n.read_at ? n : { ...n, read_at: now })),
+    );
     try {
       await markAllNotificationsRead(userId);
     } catch {
@@ -327,7 +349,10 @@ function NotificationBell({ userId }: { userId: string }) {
       </button>
       {isOpen && (
         <>
-          <div className="fixed inset-0 z-40" onClick={() => setIsOpen(false)} />
+          <div
+            className="fixed inset-0 z-40"
+            onClick={() => setIsOpen(false)}
+          />
           <div className="absolute right-0 top-full z-50 mt-2 max-h-96 w-80 overflow-y-auto rounded-2xl border border-slate-200/70 bg-white shadow-lg">
             <div className="flex items-center justify-between border-b border-slate-100 px-4 py-3">
               <h4 className="text-sm font-semibold tracking-tight text-slate-900">
@@ -365,7 +390,9 @@ function NotificationBell({ userId }: { userId: string }) {
                       <div
                         className={cn(
                           "mt-0.5 flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-full",
-                          n.type === "announcement" ? "bg-sky-100" : "bg-emerald-100",
+                          n.type === "announcement"
+                            ? "bg-sky-100"
+                            : "bg-emerald-100",
                         )}
                       >
                         {n.type === "announcement" ? (
@@ -1168,10 +1195,12 @@ function MyReportsScreen({ profile }: { profile: Profile | null }) {
   );
 }
 
-function FeedScreen() {
+function FeedScreen({ profile }: { profile: Profile | null }) {
   const [announcements, setAnnouncements] = useState<Announcement[]>([]);
-  const [resolvedIssues, setResolvedIssues] = useState<PublicIssue[]>([]);
+  const [allIssues, setAllIssues] = useState<PublicIssue[]>([]);
   const [loading, setLoading] = useState(true);
+  const [subTab, setSubTab] = useState<"trending" | "resolved">("trending");
+  const [votingId, setVotingId] = useState<string | null>(null);
 
   useEffect(() => {
     (async () => {
@@ -1181,16 +1210,50 @@ function FeedScreen() {
           fetchPublicIssues(),
         ]);
         setAnnouncements(ann);
-        setResolvedIssues(
-          issues.filter(
-            (i) => i.status === "resolved" || i.status === "verified",
-          ),
-        );
+        setAllIssues(issues);
       } finally {
         setLoading(false);
       }
     })();
   }, []);
+
+  const resolvedIssues = allIssues.filter(
+    (i) => i.status === "resolved" || i.status === "verified",
+  );
+  const openIssues = allIssues
+    .filter((i) => i.status !== "resolved" && i.status !== "verified")
+    .slice()
+    .sort(
+      (a, b) =>
+        b.vote_count - a.vote_count ||
+        new Date(b.created_at).getTime() - new Date(a.created_at).getTime(),
+    );
+
+  const handleVote = async (issueId: string) => {
+    if (!profile || votingId) return;
+    setVotingId(issueId);
+    const delta = (voted: boolean) => (voted ? -1 : 1);
+    setAllIssues((prev) =>
+      prev.map((i) =>
+        i.id === issueId
+          ? { ...i, has_voted: !i.has_voted, vote_count: i.vote_count + delta(i.has_voted) }
+          : i,
+      ),
+    );
+    try {
+      await toggleIssueVote(issueId);
+    } catch {
+      setAllIssues((prev) =>
+        prev.map((i) =>
+          i.id === issueId
+            ? { ...i, has_voted: !i.has_voted, vote_count: i.vote_count + delta(i.has_voted) }
+            : i,
+        ),
+      );
+    } finally {
+      setVotingId(null);
+    }
+  };
 
   const items: Array<{
     id: string;
@@ -1225,10 +1288,88 @@ function FeedScreen() {
           <Search className="h-4 w-4 text-slate-500" />
         </div>
       </div>
+
+      <div className="flex gap-1 rounded-full bg-slate-100 p-1">
+        <button
+          onClick={() => setSubTab("trending")}
+          className={cn(
+            "flex-1 rounded-full px-3 py-1.5 text-sm font-medium transition-all",
+            subTab === "trending"
+              ? "bg-white text-slate-900 shadow-sm"
+              : "text-slate-500 hover:text-slate-700",
+          )}
+        >
+          Trending
+        </button>
+        <button
+          onClick={() => setSubTab("resolved")}
+          className={cn(
+            "flex-1 rounded-full px-3 py-1.5 text-sm font-medium transition-all",
+            subTab === "resolved"
+              ? "bg-white text-slate-900 shadow-sm"
+              : "text-slate-500 hover:text-slate-700",
+          )}
+        >
+          Resolved
+        </button>
+      </div>
+
       {loading ? (
         <div className="py-20 text-center text-sm text-slate-500">
           Loading the feed…
         </div>
+      ) : subTab === "trending" ? (
+        openIssues.length === 0 ? (
+          <div className="rounded-2xl border border-dashed border-slate-200 bg-white p-8 text-center text-sm text-slate-500">
+            No open issues yet. Report one to get it noticed.
+          </div>
+        ) : (
+          <div className="space-y-4">
+            {openIssues.map((issue) => (
+              <AppleCard key={issue.id}>
+                <div className="flex items-start gap-4">
+                  <button
+                    onClick={() => handleVote(issue.id)}
+                    disabled={votingId === issue.id}
+                    aria-pressed={issue.has_voted}
+                    aria-label={
+                      issue.has_voted
+                        ? "Remove hype from this issue"
+                        : "Hype this issue so staff notice it"
+                    }
+                    className={cn(
+                      "flex shrink-0 flex-col items-center justify-center gap-0.5 rounded-2xl border px-3 py-2 transition-all active:scale-95 disabled:opacity-60",
+                      issue.has_voted
+                        ? "border-orange-200 bg-orange-50 text-orange-600"
+                        : "border-slate-200 bg-white text-slate-500 hover:bg-slate-50",
+                    )}
+                  >
+                    <Flame
+                      className={cn("h-4 w-4", issue.has_voted && "fill-orange-500")}
+                    />
+                    <span className="text-xs font-semibold tabular-nums">
+                      {issue.vote_count}
+                    </span>
+                  </button>
+                  <div className="min-w-0 flex-1">
+                    <div className="mb-1 flex items-start justify-between gap-2">
+                      <h3 className="text-base font-semibold tracking-tight text-slate-900">
+                        {issue.title}
+                      </h3>
+                      <Pill color={statusPillColor(issue.status)}>
+                        {STATUS_LABELS[issue.status]}
+                      </Pill>
+                    </div>
+                    <p className="text-xs text-slate-500">
+                      #{issue.tracking_code} • {CATEGORY_LABELS[issue.category]}
+                      {issue.location ? ` • ${issue.location}` : ""}
+                    </p>
+                  </div>
+                </div>
+              </AppleCard>
+            ))}
+          </div>
+        )
       ) : items.length === 0 ? (
         <div className="rounded-2xl border border-dashed border-slate-200 bg-white p-8 text-center text-sm text-slate-500">
           No public updates yet. Be the first to report something.
@@ -1579,6 +1720,7 @@ function AdminScreen({ profile }: { profile: Profile | null }) {
   const [issues, setIssues] = useState<Issue[]>([]);
   const [loading, setLoading] = useState(true);
   const [statusFilter, setStatusFilter] = useState<IssueStatus | "all">("all");
+  const [sortByVotes, setSortByVotes] = useState(false);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -1591,7 +1733,9 @@ function AdminScreen({ profile }: { profile: Profile | null }) {
         setError(null);
       })
       .catch((err) =>
-        setError(err instanceof Error ? err.message : "Could not load the queue."),
+        setError(
+          err instanceof Error ? err.message : "Could not load the queue.",
+        ),
       );
 
   useEffect(() => {
@@ -1639,10 +1783,17 @@ function AdminScreen({ profile }: { profile: Profile | null }) {
     );
   }
 
-  const filtered =
+  const filtered = (
     statusFilter === "all"
       ? issues
-      : issues.filter((i) => i.status === statusFilter);
+      : issues.filter((i) => i.status === statusFilter)
+  )
+    .slice()
+    .sort((a, b) =>
+      sortByVotes
+        ? b.vote_count - a.vote_count
+        : new Date(b.created_at).getTime() - new Date(a.created_at).getTime(),
+    );
 
   return (
     <div className="space-y-6 pb-20 md:pb-6">
@@ -1655,20 +1806,35 @@ function AdminScreen({ profile }: { profile: Profile | null }) {
             {issues.length} total report{issues.length === 1 ? "" : "s"}
           </p>
         </div>
-        <select
-          value={statusFilter}
-          onChange={(e) =>
-            setStatusFilter(e.target.value as IssueStatus | "all")
-          }
-          className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 shadow-sm focus:outline-none focus:ring-2 focus:ring-sky-200"
-        >
-          <option value="all">All statuses</option>
-          {STATUS_STEPS.map((s) => (
-            <option key={s} value={s}>
-              {STATUS_LABELS[s]}
-            </option>
-          ))}
-        </select>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => setSortByVotes((v) => !v)}
+            aria-pressed={sortByVotes}
+            className={cn(
+              "flex items-center gap-1.5 rounded-xl border px-3 py-2 text-sm font-medium shadow-sm transition-all",
+              sortByVotes
+                ? "border-orange-200 bg-orange-50 text-orange-600"
+                : "border-slate-200 bg-white text-slate-700 hover:bg-slate-50",
+            )}
+          >
+            <Flame className={cn("h-4 w-4", sortByVotes && "fill-orange-500")} />
+            Sort by hype
+          </button>
+          <select
+            value={statusFilter}
+            onChange={(e) =>
+              setStatusFilter(e.target.value as IssueStatus | "all")
+            }
+            className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 shadow-sm focus:outline-none focus:ring-2 focus:ring-sky-200"
+          >
+            <option value="all">All statuses</option>
+            {STATUS_STEPS.map((s) => (
+              <option key={s} value={s}>
+                {STATUS_LABELS[s]}
+              </option>
+            ))}
+          </select>
+        </div>
       </div>
       {error && (
         <div className="rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700">
@@ -1702,6 +1868,12 @@ function AdminScreen({ profile }: { profile: Profile | null }) {
                   {issue.status === "submitted" && (
                     <Pill color="gray">Not public yet</Pill>
                   )}
+                  {issue.vote_count > 0 && (
+                    <span className="inline-flex items-center gap-1 rounded-full bg-orange-50 px-2.5 py-1 text-[11px] font-medium tracking-wide text-orange-600">
+                      <Flame className="h-3 w-3 fill-orange-500" />
+                      {issue.vote_count}
+                    </span>
+                  )}
                   <Pill
                     color={
                       issue.urgency === "high"
@@ -1727,7 +1899,10 @@ function AdminScreen({ profile }: { profile: Profile | null }) {
                     value={issue.status}
                     disabled={busyId === issue.id}
                     onChange={(e) =>
-                      handleStatusChange(issue.id, e.target.value as IssueStatus)
+                      handleStatusChange(
+                        issue.id,
+                        e.target.value as IssueStatus,
+                      )
                     }
                     className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 shadow-sm focus:outline-none focus:ring-2 focus:ring-sky-200"
                   >
@@ -1862,7 +2037,7 @@ export default function HomePage() {
       case "my-reports":
         return <MyReportsScreen profile={profile} />;
       case "feed":
-        return <FeedScreen />;
+        return <FeedScreen profile={profile} />;
       case "transparency":
         return <TransparencyScreen />;
       case "rewards":
@@ -1882,9 +2057,7 @@ export default function HomePage() {
     { id: "report", icon: Plus, label: "Report", special: true },
     { id: "transparency", icon: BarChart3, label: "Pulse" },
     { id: "rewards", icon: Trophy, label: "Rewards" },
-    ...(isStaff
-      ? [{ id: "admin", icon: ClipboardList, label: "Admin" }]
-      : []),
+    ...(isStaff ? [{ id: "admin", icon: ClipboardList, label: "Admin" }] : []),
   ];
 
   const firstName = profile?.full_name?.split(" ")[0] ?? "Voice";
@@ -1945,7 +2118,9 @@ export default function HomePage() {
                 height={40}
                 className="h-10 w-10"
               />
-              <span className="text-2xl font-semibold tracking-tight">AURA</span>
+              <span className="text-2xl font-semibold tracking-tight">
+                AURA
+              </span>
             </div>
             <NotificationBell userId={session.user.id} />
           </div>

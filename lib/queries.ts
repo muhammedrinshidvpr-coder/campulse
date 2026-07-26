@@ -83,11 +83,19 @@ export async function verifyIssue(issueId: string): Promise<void> {
   if (error) throw error;
 }
 
-// Staff-only: relies on the `issues_select_staff` RLS policy, which returns
-// every row (not just the caller's own) when profiles.role is a staff role.
+// Toggles the caller's upvote on an issue; returns the new voted state.
+export async function toggleIssueVote(issueId: string): Promise<boolean> {
+  const { data, error } = await client().rpc('toggle_issue_vote', { p_issue_id: issueId });
+  if (error) throw error;
+  return data as boolean;
+}
+
+// Staff-only: reads through the `issues_staff` view, which is gated to staff
+// roles and nulls out reporter_id on anonymous reports so staff can't
+// deanonymize them just by loading the queue.
 export async function fetchAllIssuesForStaff(): Promise<Issue[]> {
   const { data, error } = await client()
-    .from('issues')
+    .from('issues_staff')
     .select('*')
     .order('created_at', { ascending: false });
   if (error) throw error;

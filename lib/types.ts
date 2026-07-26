@@ -45,6 +45,8 @@ export interface Issue {
   resolution_note: string | null;
   verified_by_student: boolean;
   sla_due_at: string | null;
+  vote_count: number;
+  has_voted: boolean;
   created_at: string;
   updated_at: string;
   closed_at: string | null;
@@ -63,6 +65,8 @@ export interface PublicIssue {
   escalation_level: number;
   resolution_note: string | null;
   verified_by_student: boolean;
+  vote_count: number;
+  has_voted: boolean;
   created_at: string;
   updated_at: string;
   closed_at: string | null;
