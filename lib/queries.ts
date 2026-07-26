@@ -4,11 +4,14 @@ import type {
   Badge,
   Issue,
   IssueCategory,
+  IssueStatus,
   IssueUrgency,
   LeaderboardEntry,
+  Notification,
   Profile,
   PublicIssue,
   PublicStats,
+  UserRole,
 } from './types';
 
 function client() {
@@ -80,6 +83,40 @@ export async function verifyIssue(issueId: string): Promise<void> {
   if (error) throw error;
 }
 
+// Staff-only: relies on the `issues_select_staff` RLS policy, which returns
+// every row (not just the caller's own) when profiles.role is a staff role.
+export async function fetchAllIssuesForStaff(): Promise<Issue[]> {
+  const { data, error } = await client()
+    .from('issues')
+    .select('*')
+    .order('created_at', { ascending: false });
+  if (error) throw error;
+  return (data ?? []) as Issue[];
+}
+
+export interface IssueUpdateInput {
+  status?: IssueStatus;
+  ownerRole?: UserRole;
+  resolutionNote?: string;
+}
+
+// Staff-only: relies on the `issues_update_staff` RLS policy.
+export async function updateIssue(issueId: string, input: IssueUpdateInput): Promise<Issue> {
+  const patch: Record<string, unknown> = {};
+  if (input.status !== undefined) patch.status = input.status;
+  if (input.ownerRole !== undefined) patch.owner_role = input.ownerRole;
+  if (input.resolutionNote !== undefined) patch.resolution_note = input.resolutionNote;
+
+  const { data, error } = await client()
+    .from('issues')
+    .update(patch)
+    .eq('id', issueId)
+    .select('*')
+    .single();
+  if (error) throw error;
+  return data as Issue;
+}
+
 export async function fetchPublicStats(): Promise<PublicStats> {
   const { data, error } = await client().from('public_stats').select('*').single();
   if (error) throw error;
@@ -133,4 +170,32 @@ export async function fetchLeaderboard(limit = 10): Promise<LeaderboardEntry[]> 
   const { data, error } = await client().from('leaderboard').select('*').limit(limit);
   if (error) throw error;
   return (data ?? []) as LeaderboardEntry[];
+}
+
+export async function fetchNotifications(userId: string, limit = 30): Promise<Notification[]> {
+  const { data, error } = await client()
+    .from('notifications')
+    .select('*')
+    .eq('user_id', userId)
+    .order('created_at', { ascending: false })
+    .limit(limit);
+  if (error) throw error;
+  return (data ?? []) as Notification[];
+}
+
+export async function markNotificationRead(notificationId: string): Promise<void> {
+  const { error } = await client()
+    .from('notifications')
+    .update({ read_at: new Date().toISOString() })
+    .eq('id', notificationId);
+  if (error) throw error;
+}
+
+export async function markAllNotificationsRead(userId: string): Promise<void> {
+  const { error } = await client()
+    .from('notifications')
+    .update({ read_at: new Date().toISOString() })
+    .eq('user_id', userId)
+    .is('read_at', null);
+  if (error) throw error;
 }

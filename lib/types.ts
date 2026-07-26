@@ -95,3 +95,16 @@ export interface LeaderboardEntry {
   display_name: string;
   contribution_score: number;
 }
+
+export type NotificationType = 'issue_status' | 'announcement';
+
+export interface Notification {
+  id: string;
+  user_id: string;
+  type: NotificationType;
+  issue_id: string | null;
+  title: string;
+  body: string | null;
+  read_at: string | null;
+  created_at: string;
+}

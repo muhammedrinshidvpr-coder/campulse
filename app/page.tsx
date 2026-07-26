@@ -12,9 +12,11 @@ import type {
   IssueStatus,
   IssueUrgency,
   LeaderboardEntry,
+  Notification,
   Profile,
   PublicIssue,
   PublicStats,
+  UserRole,
 } from "@/lib/types";
 import {
   CATEGORIES,
@@ -28,14 +30,19 @@ import {
 import {
   attachIssuePhoto,
   fetchAllBadges,
+  fetchAllIssuesForStaff,
   fetchAnnouncements,
   fetchLeaderboard,
   fetchMyBadgeCodes,
   fetchMyIssues,
+  fetchNotifications,
   fetchProfile,
   fetchPublicIssues,
   fetchPublicStats,
+  markAllNotificationsRead,
+  markNotificationRead,
   submitIssue,
+  updateIssue,
   uploadIssuePhoto,
   verifyIssue,
 } from "@/lib/queries";
@@ -48,6 +55,7 @@ import {
   Check,
   CheckCircle2,
   ChevronRight,
+  ClipboardList,
   Flame,
   Home as HomeIcon,
   Image as ImageIcon,
@@ -233,6 +241,163 @@ function QuestStepper({
           </div>
         );
       })}
+    </div>
+  );
+}
+
+function NotificationBell({ userId }: { userId: string }) {
+  const [notifications, setNotifications] = useState<Notification[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [isOpen, setIsOpen] = useState(false);
+
+  const unreadCount = notifications.filter((n) => !n.read_at).length;
+
+  useEffect(() => {
+    let active = true;
+    (async () => {
+      try {
+        const data = await fetchNotifications(userId);
+        if (active) setNotifications(data);
+      } finally {
+        if (active) setLoading(false);
+      }
+    })();
+    return () => {
+      active = false;
+    };
+  }, [userId]);
+
+  useEffect(() => {
+    const client = supabase;
+    if (!client) return;
+    const channel = client
+      .channel(`notifications-${userId}`)
+      .on<Notification>(
+        "postgres_changes",
+        {
+          event: "INSERT",
+          schema: "public",
+          table: "notifications",
+          filter: `user_id=eq.${userId}`,
+        },
+        (payload) => {
+          setNotifications((prev) => [payload.new, ...prev]);
+        },
+      )
+      .subscribe();
+    return () => {
+      client.removeChannel(channel);
+    };
+  }, [userId]);
+
+  const handleMarkRead = async (id: string) => {
+    setNotifications((prev) =>
+      prev.map((n) => (n.id === id && !n.read_at ? { ...n, read_at: new Date().toISOString() } : n)),
+    );
+    try {
+      await markNotificationRead(id);
+    } catch {
+      // best-effort; next fetch reconciles state
+    }
+  };
+
+  const handleMarkAllRead = async () => {
+    const now = new Date().toISOString();
+    setNotifications((prev) => prev.map((n) => (n.read_at ? n : { ...n, read_at: now })));
+    try {
+      await markAllNotificationsRead(userId);
+    } catch {
+      // best-effort; next fetch reconciles state
+    }
+  };
+
+  return (
+    <div className="relative">
+      <button
+        className="relative p-1"
+        onClick={() => setIsOpen((open) => !open)}
+        aria-label="Notifications"
+      >
+        <Bell className="h-6 w-6 text-slate-700" />
+        {unreadCount > 0 && (
+          <span className="absolute right-0 top-0 flex h-4 min-w-[16px] items-center justify-center rounded-full border-2 border-slate-50 bg-rose-500 px-1 text-[9px] font-semibold text-white">
+            {unreadCount > 9 ? "9+" : unreadCount}
+          </span>
+        )}
+      </button>
+      {isOpen && (
+        <>
+          <div className="fixed inset-0 z-40" onClick={() => setIsOpen(false)} />
+          <div className="absolute right-0 top-full z-50 mt-2 max-h-96 w-80 overflow-y-auto rounded-2xl border border-slate-200/70 bg-white shadow-lg">
+            <div className="flex items-center justify-between border-b border-slate-100 px-4 py-3">
+              <h4 className="text-sm font-semibold tracking-tight text-slate-900">
+                Notifications
+              </h4>
+              {unreadCount > 0 && (
+                <button
+                  className="text-xs font-medium text-sky-600 hover:text-sky-700"
+                  onClick={handleMarkAllRead}
+                >
+                  Mark all read
+                </button>
+              )}
+            </div>
+            {loading ? (
+              <p className="px-4 py-6 text-center text-xs text-slate-500">
+                Loading…
+              </p>
+            ) : notifications.length === 0 ? (
+              <p className="px-4 py-6 text-center text-xs text-slate-500">
+                You&apos;re all caught up.
+              </p>
+            ) : (
+              <div className="divide-y divide-slate-100">
+                {notifications.map((n) => (
+                  <button
+                    key={n.id}
+                    onClick={() => handleMarkRead(n.id)}
+                    className={cn(
+                      "block w-full px-4 py-3 text-left transition-colors hover:bg-slate-50",
+                      !n.read_at && "bg-sky-50/60",
+                    )}
+                  >
+                    <div className="flex items-start gap-3">
+                      <div
+                        className={cn(
+                          "mt-0.5 flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-full",
+                          n.type === "announcement" ? "bg-sky-100" : "bg-emerald-100",
+                        )}
+                      >
+                        {n.type === "announcement" ? (
+                          <Megaphone className="h-4 w-4 text-sky-600" />
+                        ) : (
+                          <BadgeCheck className="h-4 w-4 text-emerald-600" />
+                        )}
+                      </div>
+                      <div className="min-w-0 flex-1">
+                        <p className="text-sm font-medium tracking-tight text-slate-900">
+                          {n.title}
+                        </p>
+                        {n.body && (
+                          <p className="mt-0.5 text-xs leading-relaxed text-slate-500">
+                            {n.body}
+                          </p>
+                        )}
+                        <p className="mt-1 text-[11px] text-slate-400">
+                          {timeAgo(n.created_at)}
+                        </p>
+                      </div>
+                      {!n.read_at && (
+                        <span className="mt-1.5 h-2 w-2 flex-shrink-0 rounded-full bg-sky-500" />
+                      )}
+                    </div>
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+        </>
+      )}
     </div>
   );
 }
@@ -1395,6 +1560,228 @@ function RewardsScreen({ profile }: { profile: Profile | null }) {
   );
 }
 
+const OWNER_ROLE_LABELS: Record<UserRole, string> = {
+  student: "Student",
+  faculty: "Faculty Coordinator",
+  warden: "Hostel Warden",
+  admin: "Admin Staff",
+  student_affairs: "Student Affairs",
+};
+
+const ASSIGNABLE_ROLES: UserRole[] = [
+  "faculty",
+  "warden",
+  "admin",
+  "student_affairs",
+];
+
+function AdminScreen({ profile }: { profile: Profile | null }) {
+  const [issues, setIssues] = useState<Issue[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [statusFilter, setStatusFilter] = useState<IssueStatus | "all">("all");
+  const [busyId, setBusyId] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const isStaff = profile ? profile.role !== "student" : false;
+
+  const refresh = () =>
+    fetchAllIssuesForStaff()
+      .then((rows) => {
+        setIssues(rows);
+        setError(null);
+      })
+      .catch((err) =>
+        setError(err instanceof Error ? err.message : "Could not load the queue."),
+      );
+
+  useEffect(() => {
+    if (!isStaff) return;
+    refresh().finally(() => setLoading(false));
+  }, [isStaff]);
+
+  const handleStatusChange = async (issueId: string, status: IssueStatus) => {
+    setBusyId(issueId);
+    try {
+      await updateIssue(issueId, { status });
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not update status.");
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const handleOwnerChange = async (issueId: string, ownerRole: UserRole) => {
+    setBusyId(issueId);
+    try {
+      await updateIssue(issueId, { ownerRole });
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not assign owner.");
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const handleNoteBlur = async (issueId: string, note: string) => {
+    try {
+      await updateIssue(issueId, { resolutionNote: note });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not save note.");
+    }
+  };
+
+  if (!isStaff) {
+    return (
+      <div className="py-20 text-center text-sm text-slate-500">
+        You don&apos;t have access to this page.
+      </div>
+    );
+  }
+
+  const filtered =
+    statusFilter === "all"
+      ? issues
+      : issues.filter((i) => i.status === statusFilter);
+
+  return (
+    <div className="space-y-6 pb-20 md:pb-6">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <h2 className="text-2xl font-semibold tracking-tight text-slate-900">
+            Admin — Issue Queue
+          </h2>
+          <p className="mt-1 text-sm text-slate-500">
+            {issues.length} total report{issues.length === 1 ? "" : "s"}
+          </p>
+        </div>
+        <select
+          value={statusFilter}
+          onChange={(e) =>
+            setStatusFilter(e.target.value as IssueStatus | "all")
+          }
+          className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 shadow-sm focus:outline-none focus:ring-2 focus:ring-sky-200"
+        >
+          <option value="all">All statuses</option>
+          {STATUS_STEPS.map((s) => (
+            <option key={s} value={s}>
+              {STATUS_LABELS[s]}
+            </option>
+          ))}
+        </select>
+      </div>
+      {error && (
+        <div className="rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700">
+          {error}
+        </div>
+      )}
+      {loading ? (
+        <div className="py-20 text-center text-sm text-slate-500">
+          Loading queue…
+        </div>
+      ) : filtered.length === 0 ? (
+        <div className="rounded-2xl border border-dashed border-slate-200 bg-white p-8 text-center text-sm text-slate-500">
+          Nothing here.
+        </div>
+      ) : (
+        <div className="space-y-4">
+          {filtered.map((issue) => (
+            <AppleCard key={issue.id}>
+              <div className="mb-3 flex items-start justify-between gap-3">
+                <div>
+                  <h3 className="text-base font-semibold tracking-tight text-slate-900">
+                    {issue.title}
+                  </h3>
+                  <p className="mt-0.5 text-xs text-slate-500">
+                    #{issue.tracking_code} • {CATEGORY_LABELS[issue.category]}
+                    {issue.location ? ` • ${issue.location}` : ""}
+                    {issue.is_anonymous ? " • Anonymous" : ""}
+                  </p>
+                </div>
+                <div className="flex shrink-0 items-center gap-2">
+                  {issue.status === "submitted" && (
+                    <Pill color="gray">Not public yet</Pill>
+                  )}
+                  <Pill
+                    color={
+                      issue.urgency === "high"
+                        ? "red"
+                        : issue.urgency === "medium"
+                          ? "blue"
+                          : "gray"
+                    }
+                  >
+                    {issue.urgency}
+                  </Pill>
+                </div>
+              </div>
+              <p className="mb-4 text-sm leading-relaxed text-slate-600">
+                {issue.description}
+              </p>
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                <div className="space-y-1">
+                  <label className="text-xs font-medium text-slate-500">
+                    Status
+                  </label>
+                  <select
+                    value={issue.status}
+                    disabled={busyId === issue.id}
+                    onChange={(e) =>
+                      handleStatusChange(issue.id, e.target.value as IssueStatus)
+                    }
+                    className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 shadow-sm focus:outline-none focus:ring-2 focus:ring-sky-200"
+                  >
+                    {STATUS_STEPS.map((s) => (
+                      <option key={s} value={s}>
+                        {STATUS_LABELS[s]}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div className="space-y-1">
+                  <label className="text-xs font-medium text-slate-500">
+                    Assign to
+                  </label>
+                  <select
+                    value={issue.owner_role ?? ""}
+                    disabled={busyId === issue.id}
+                    onChange={(e) =>
+                      handleOwnerChange(issue.id, e.target.value as UserRole)
+                    }
+                    className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 shadow-sm focus:outline-none focus:ring-2 focus:ring-sky-200"
+                  >
+                    <option value="" disabled>
+                      Unassigned
+                    </option>
+                    {ASSIGNABLE_ROLES.map((r) => (
+                      <option key={r} value={r}>
+                        {OWNER_ROLE_LABELS[r]}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              </div>
+              <div className="mt-3 space-y-1">
+                <label className="text-xs font-medium text-slate-500">
+                  Resolution note (shown on the Transparency Board)
+                </label>
+                <textarea
+                  key={`${issue.id}-${issue.updated_at}`}
+                  defaultValue={issue.resolution_note ?? ""}
+                  onBlur={(e) => handleNoteBlur(issue.id, e.target.value)}
+                  rows={2}
+                  placeholder="What changed, who acted, when…"
+                  className="w-full resize-none rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 shadow-sm focus:outline-none focus:ring-2 focus:ring-sky-200"
+                />
+              </div>
+            </AppleCard>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function HomePage() {
   const [session, setSession] = useState<Session | null>(null);
   const [profileData, setProfileData] = useState<Profile | null>(null);
@@ -1480,10 +1867,14 @@ export default function HomePage() {
         return <TransparencyScreen />;
       case "rewards":
         return <RewardsScreen profile={profile} />;
+      case "admin":
+        return <AdminScreen profile={profile} />;
       default:
         return <HomeScreen onNavigate={setCurrentTab} profile={profile} />;
     }
   };
+
+  const isStaff = profile ? profile.role !== "student" : false;
 
   const navItems = [
     { id: "home", icon: HomeIcon, label: "Home" },
@@ -1491,6 +1882,9 @@ export default function HomePage() {
     { id: "report", icon: Plus, label: "Report", special: true },
     { id: "transparency", icon: BarChart3, label: "Pulse" },
     { id: "rewards", icon: Trophy, label: "Rewards" },
+    ...(isStaff
+      ? [{ id: "admin", icon: ClipboardList, label: "Admin" }]
+      : []),
   ];
 
   const firstName = profile?.full_name?.split(" ")[0] ?? "Voice";
@@ -1510,10 +1904,7 @@ export default function HomePage() {
             <span className="text-xl font-semibold tracking-tight">AURA</span>
           </div>
           <div className="flex items-center gap-4">
-            <button className="relative p-1">
-              <Bell className="h-6 w-6 text-slate-700" />
-              <span className="absolute right-1 top-1 h-2.5 w-2.5 rounded-full border-2 border-slate-50 bg-rose-500" />
-            </button>
+            <NotificationBell userId={session.user.id} />
             <button
               className="p-1"
               onClick={() => setIsMobileMenuOpen(!isMobileMenuOpen)}
@@ -1545,15 +1936,18 @@ export default function HomePage() {
       )}
       <aside className="fixed left-0 top-0 hidden h-screen w-64 flex-col border-r border-slate-200 bg-white text-slate-900 md:flex">
         <div className="p-6">
-          <div className="mb-10 flex items-center gap-3">
-            <Image
-              src="/logo.svg"
-              alt="AURA logo"
-              width={40}
-              height={40}
-              className="h-10 w-10"
-            />
-            <span className="text-2xl font-semibold tracking-tight">AURA</span>
+          <div className="mb-10 flex items-center justify-between gap-3">
+            <div className="flex items-center gap-3">
+              <Image
+                src="/logo.svg"
+                alt="AURA logo"
+                width={40}
+                height={40}
+                className="h-10 w-10"
+              />
+              <span className="text-2xl font-semibold tracking-tight">AURA</span>
+            </div>
+            <NotificationBell userId={session.user.id} />
           </div>
           <nav className="space-y-1.5">
             {navItems.map((item) => (
